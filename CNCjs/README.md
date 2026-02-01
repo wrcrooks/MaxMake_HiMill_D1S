@@ -34,7 +34,7 @@ sudo touch /etc/systemd/system/cncjs.service
 sudo chmod 664 /etc/systemd/system/cncjs.service
 sudo nano /etc/systemd/system/cncjs.service
 ```
-Place the Following in /etc/systemd/system/cncjs.service
+Place the Following in `/etc/systemd/system/cncjs.service`
 ```
 [Unit]
 Description=CNC Controller Web UI
@@ -59,7 +59,7 @@ sudo systemctl enable cncjs
 sudo mkdir /cncjs
 nano ~/.cncrc
 ```
-Place the Following in ~/.cncrc
+Place the Following in `~/.cncrc`
 ```
 {
     "state": {
@@ -135,7 +135,7 @@ sudo touch /etc/systemd/system/webcamd.service
 sudo chmod 664 /etc/systemd/system/webcamd.service
 sudo nano /etc/systemd/system/webcamd.service
 ```
-Place the Following in /etc/systemd/system/webcamd.service
+Place the Following in `/etc/systemd/system/webcamd.service`
 ```
 [Unit]
 Description=Webcam Stream
