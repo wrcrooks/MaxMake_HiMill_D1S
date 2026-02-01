@@ -113,6 +113,12 @@ Place the Following in `~/.cncrc`
             "mtime": 1769560481437,
             "name": "Tool Change",
             "content": "T1 M06"
+        },
+        {
+            "id": "943a04bc-1067-400c-98b7-b41fafb1dcd7",
+            "mtime": 1769985084869,
+            "name": "Frame Work Area",
+            "content": "; Traverse around the boundary\nG90\nG0 Z10 ; go to z-safe\nG0 X[xmin] Y[ymin]\nG0 X[xmax]\nG0 Y[ymax]\nG0 X[xmin]\nG0 Y[ymin]"
         }
     ]
 }
