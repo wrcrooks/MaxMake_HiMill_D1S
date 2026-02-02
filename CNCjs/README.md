@@ -119,6 +119,18 @@ Place the Following in `~/.cncrc`
             "mtime": 1769985084869,
             "name": "Frame Work Area",
             "content": "; Traverse around the boundary\nG90\nG0 Z10 ; go to z-safe\nG0 X[xmin] Y[ymin]\nG0 X[xmax]\nG0 Y[ymax]\nG0 X[xmin]\nG0 Y[ymin]"
+        },
+        {
+            "id": "d0bb07d5-db19-454a-a25e-311917412dfb",
+            "mtime": 1769998363090,
+            "name": "Probe X",
+            "content": "; X-Probe\nG91\nG38.2 X100 F200\nG90\n; Set the active WCS X0\nG10 L20 P1 X0\n; Retract from the touch plate\nG91\nG0 X-4\nG90"
+        },
+        {
+            "id": "b21396d7-d1ab-4ccc-827b-80cacc2a6969",
+            "mtime": 1769998376291,
+            "name": "Probe Y",
+            "content": "; Y-Probe\nG91\nG38.2 Y100 F200\nG90\n; Set the active WCS Y0\nG10 L20 P1 Y0\n; Retract from the touch plate\nG91\nG0 Y-4\nG90"
         }
     ]
 }
