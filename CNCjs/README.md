@@ -176,7 +176,7 @@ sudo systemctl enable webcamd
 ```
 
 ### Known Issues
-- I'm still actively working on how CNCjs interacts with the machine during M6 tool changes. You can track the progress of that quest [here](https://github.com/cncjs/cncjs/discussions/958). The workaround proceedure is as follows:
+- I'm still actively working on how CNCjs interacts with the machine during M6 tool changes. You can track the progress of that quest [here](https://github.com/cncjs/cncjs/discussions/958). The workaround procedure is as follows:
   1. Set CNCjs to "Ignore M6 commands (Default)"
   2. Run the GCODE
   3. When the prompt to change the tool comes up in the webpage, issue a `T<x>M6` command in the console (where `<x>` is the tool number in the workplan)
