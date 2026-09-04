@@ -76,7 +76,7 @@ Place the Following in `~/.cncrc`
     "allowRemoteAccess": true,
     "accessTokenLifetime": "365d",
     "tool": {
-        "toolChangePolicy": 0,
+        "toolChangePolicy": 1,
         "toolChangeX": 0,
         "toolChangeY": 0,
         "toolChangeZ": 0,
@@ -176,7 +176,20 @@ sudo systemctl enable webcamd
 ```
 
 ### Known Issues
-- I'm still actively working on how CNCjs interacts with the machine during M6 tool changes. You can track the progress of that quest [here](https://github.com/cncjs/cncjs/discussions/958). The workaround procedure is as follows:
+- I'm still actively working on how CNCjs interacts with the machine during M6 tool changes. You can track the progress of that quest [here](https://github.com/cncjs/cncjs/discussions/958).
+
+  **Root cause:** CNCjs's `tool.toolChangePolicy` in `~/.cncrc` defaults to `0` ("Ignore M6 commands"), which strips the `M6` line out of the running program entirely instead of sending it to the controller — that's why a manual `T<x>M6` had to be retyped into the console to actually trigger the D1S's onboard tool-change routine. Setting `toolChangePolicy` to `1` ("Send M6 commands") makes CNCjs forward the `M6` line to the controller exactly as written, so the D1S's own tool-change/auto-probe cycle fires automatically when the program reaches it (see the [CNCjs Tool widget source](https://github.com/cncjs/cncjs/blob/master/src/app/widgets/Tool/Tool.jsx) for the exact policy definitions). The `.cncrc` above now reflects `toolChangePolicy: 1`.
+
+  With `toolChangePolicy: 1`, the process should simplify to:
+  1. Run the GCODE as normal. When the program reaches a `T<x> M6` line, it's sent straight to the controller and the D1S moves to the tool change position on its own (front light glows orange) — no manual console command needed.
+  2. Change the tool and push the front outer or internal button to let the machine probe the height of the installed tool.
+  3. Once probing completes and the machine returns to a ready state, resume the job.
+
+  *Note: This has not yet been verified against real hardware for a full job. It assumes the D1S's onboard probe cycle correctly restores Work Zero on its own — if Work Zero still drifts afterward, that points to a genuine firmware/CNCjs interaction bug (not a config issue) and is worth a follow-up comment on the [linked discussion](https://github.com/cncjs/cncjs/discussions/958). Until confirmed, fall back to the legacy manual procedure below.*
+
+  Use [gcode/tool-change-test.gcode](gcode/tool-change-test.gcode) to validate the `toolChangePolicy: 1` change on real hardware before trusting it in a production job. It runs 3 tool changes (`T1`/`T2`/`T3` `M6`) and a return-to-Work-Zero check after each, entirely at a safe clearance height with the spindle never commanded on.
+
+  **Legacy manual workaround** (`toolChangePolicy: 0`):
   1. Set CNCjs to "Ignore M6 commands (Default)"
   2. Run the GCODE
   3. When the prompt to change the tool comes up in the webpage, issue a `T<x>M6` command in the console (where `<x>` is the tool number in the workplan)
