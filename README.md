@@ -8,6 +8,8 @@ This file is a FreeCAD Post-Processor meant to be used with the MaxMake HiMill D
 
 The Post-Processor can be added to FreeCAD by placing it in the `C:\Program Files\FreeCAD X.X\Mod\CAM\Path\Post\scripts` (Windows) directory, or the equivalent path in Linux or MacOS.
 
+**Tool changes:** the D1S zeroes G54 on every `M6`, and a running program cannot safely drive its tool change cycle (details in the [CNCjs README](CNCjs/README.md#tool-changes-m6)), so the Post-Processor never writes `M6`. Each tool change instead starts a new file (`job_01_T1.nc`, `job_02_T2.nc`, ...) that ends with a retract and spindle off. The top of each file lists what to do before running it: probe and touch off for the first tool, and for later tools the `SAVE_BEFORE_M6` / `T<n>M6` / `RESTORE_AFTER_M6` steps from the CNCjs README. A job with a single tool still produces a single file.
+
 ### CNCjs
 #### - [README.md](CNCjs/README.md)
 This file contains the documentation of my journey using CNCjs to replace the MaxmakeLAB software.

@@ -4,6 +4,8 @@ import Path
 import Path.Post.Utils as PostUtils
 import argparse
 import datetime
+import os
+import re
 import shlex
 from PathScripts import PathUtils
 import PathScripts.PathUtils as PathUtils
@@ -18,6 +20,12 @@ FreeCAD, via the GUI importer or via python scripts with:
 
 import maxmake_post
 maxmake_post.export(object,"/path/to/file.ncc","")
+
+Tool changes: the D1S zeroes G54 on every M6 and applies no tool length offset, and a
+running program cannot safely drive its tool change cycle, so M6 is never written to the
+G-code. Instead every tool change starts a new file (<name>_01_T1.nc, <name>_02_T2.nc, ...)
+and each file begins with a comment block listing the steps to take before running it
+(the SAVE_BEFORE_M6 / RESTORE_AFTER_M6 macros, see CNCjs/README.md).
 """
 
 now = datetime.datetime.now()
@@ -72,8 +80,16 @@ CORNER_MIN = {"x": 0, "y": 0, "z": 0}
 CORNER_MAX = {"x": 1000, "y": 600, "z": 300}
 PRECISION = 3
 
-# Globals to maintain progress throughout GCODE generation
+# Globals to maintain progress throughout GCODE generation (reset at the start of every export)
 TOOL_CHANGE_INDEX = 0
+
+# parse() leaves this marker where an M6 was; export() splits the output into one file per tool there
+TOOL_CHANGE_MARKER = "@@TOOLCHANGE %d@@\n"
+TOOL_CHANGE_MARKER_RE = r"@@TOOLCHANGE (\d+)@@\n"
+
+# CNCjs macros that rebuild the work zero around a tool change (see CNCjs/README.md)
+SAVE_MACRO = "SAVE_BEFORE_M6"
+RESTORE_MACRO = "RESTORE_AFTER_M6"
 
 # Preamble text will appear at the beginning of the GCODE output file.
 PREAMBLE = """"""
@@ -91,7 +107,7 @@ PRE_OPERATION = """"""
 # Post operation text will be inserted after every operation
 POST_OPERATION = """"""
 
-# Tool Change commands will be inserted before a tool change
+# Tool Change commands are written at the end of the file that precedes a tool change
 TOOL_CHANGE = """G0Z5.000S13000
 M5
 """
@@ -162,20 +178,34 @@ def export(objectslist, filename, argstring):
             return None
 
     print("postprocessing...")
-    gcode = ""
+    global TOOL_CHANGE_INDEX
+    TOOL_CHANGE_INDEX = 0  # state from a previous export in this session must not leak in
+
+    head = ""
 
     # write header
     if OUTPUT_HEADER:
-        gcode += linenumber() + "(Exported by FreeCAD)\n"
-        gcode += linenumber() + "(Post Processor: " + __name__ + ")\n"
-        gcode += linenumber() + "(Output Time:" + str(now) + ")\n"
+        head += linenumber() + "(Exported by FreeCAD)\n"
+        head += linenumber() + "(Post Processor: " + __name__ + ")\n"
+        head += linenumber() + "(Output Time:" + str(now) + ")\n"
 
     # Write the preamble
     if OUTPUT_COMMENTS:
-        gcode += linenumber() + "(begin preamble)\n"
+        head += linenumber() + "(begin preamble)\n"
     for line in PREAMBLE.splitlines(False):
-        gcode += linenumber() + line + "\n"
-    # gcode += linenumber() + UNITS + "\n"
+        head += linenumber() + line + "\n"
+    # head += linenumber() + UNITS + "\n"
+
+    # Every tool change (M6) starts a new file. Text before the first tool change is kept
+    # in `prefix`; each later piece is a [tool number, text] entry in `sections`.
+    prefix = [""]
+    sections = []
+
+    def add(text):
+        if sections:
+            sections[-1][1] += text
+        else:
+            prefix[0] += text
 
     for obj in objectslist:
 
@@ -198,48 +228,132 @@ def export(objectslist, filename, argstring):
                 UNIT_SPEED_FORMAT = "in/min"
 
         # do the pre_op
+        begin = ""
         if OUTPUT_COMMENTS:
-            gcode += linenumber() + "(begin operation: %s)\n" % obj.Label
-            gcode += linenumber() + "(machine: %s, %s)\n" % (
+            begin += linenumber() + "(begin operation: %s)\n" % obj.Label
+            begin += linenumber() + "(machine: %s, %s)\n" % (
                 myMachine,
                 UNIT_SPEED_FORMAT,
             )
         for line in PRE_OPERATION.splitlines(True):
-            gcode += linenumber() + line
+            begin += linenumber() + line
 
-        gcode += parse(obj)
+        # parse() returns [text, tool, text, tool, text, ...] once split on its tool change markers
+        parts = re.split(TOOL_CHANGE_MARKER_RE, parse(obj))
+        if parts[0] == "" and len(parts) > 1:
+            # this object is the tool change itself: its "begin operation" comment belongs in the new file
+            sections.append([int(parts[1]), ""])
+            add(begin + parts[2])
+            rest = parts[3:]
+        else:
+            add(begin + parts[0])
+            rest = parts[1:]
+        for i in range(0, len(rest), 2):
+            sections.append([int(rest[i]), ""])
+            add(rest[i + 1])
 
         # do the post_op
+        post = ""
         if OUTPUT_COMMENTS:
-            gcode += linenumber() + "(finish operation: %s)\n" % obj.Label
+            post += linenumber() + "(finish operation: %s)\n" % obj.Label
         for line in POST_OPERATION.splitlines(True):
-            gcode += linenumber() + line
+            post += linenumber() + line
+        add(post)
 
     # do the post_amble
+    postamble = ""
     if OUTPUT_COMMENTS:
-        gcode += "(begin postamble)\n"
+        postamble += "(begin postamble)\n"
     for line in POSTAMBLE.splitlines(True):
-        gcode += linenumber() + line
+        postamble += linenumber() + line
 
-    if FreeCAD.GuiUp and SHOW_EDITOR:
+    # Assemble one output per tool (a single output when the job has no tool change)
+    if not sections:
+        tools = [None]
+        texts = [head + prefix[0] + postamble]
+    else:
+        tools = [tool for tool, _ in sections]
+        texts = []
+        for i, (tool, body) in enumerate(sections):
+            text = head + tool_banner(i, len(sections), tool)
+            if i == 0:
+                text += prefix[0]
+            text += body
+            if i < len(sections) - 1:
+                text += section_end(sections[i + 1][0])
+            else:
+                text += postamble
+            texts.append(text)
+
+    paths = output_paths(filename, tools)
+
+    if len(texts) == 1 and FreeCAD.GuiUp and SHOW_EDITOR:
         dia = PostUtils.GCodeEditorDialog()
-        dia.editor.setText(gcode)
+        dia.editor.setText(texts[0])
         result = dia.exec_()
         if result:
-            final = dia.editor.toPlainText()
-        else:
-            final = gcode
-    else:
-        final = gcode
+            texts[0] = dia.editor.toPlainText()
 
     print("done postprocessing.")
 
     if not filename == "-":
-        gfile = pyopen(filename, "w")
-        gfile.write(final)
-        gfile.close()
+        for path, text in zip(paths, texts):
+            gfile = pyopen(path, "w")
+            gfile.write(text)
+            gfile.close()
+        if len(paths) > 1:
+            print("Tool changes are done by hand, so one file was written per tool:")
+            for path in paths:
+                print("  " + path)
 
-    return final
+    return "".join(texts)
+
+
+def output_paths(filename, tools):
+    """One path when there is a single output, otherwise <name>_<nn>_T<tool>.<ext> in run order."""
+    if len(tools) == 1:
+        return [filename]
+    base, ext = os.path.splitext(filename)
+    return ["%s_%02d_T%d%s" % (base, i + 1, tool, ext) for i, tool in enumerate(tools)]
+
+
+def tool_banner(index, total, tool):
+    """Comment block at the top of each file: which tool, and what to do before running it.
+
+    Plain comments only: no parentheses or square brackets inside (CNCjs evaluates square
+    brackets and Grbl comments end at the first closing parenthesis).
+    """
+    out = linenumber() + "(file %d of %d: tool T%d)\n" % (index + 1, total, tool)
+    if not OUTPUT_COMMENTS:
+        return out
+    if index == 0:
+        lines = [
+            "Install T%d and send T%dM6 from the console so it is probed." % (tool, tool),
+            "Then touch off X Y Z on the work and set the zero with G10 L20 P1 X0 Y0 Z0.",
+            "Do not press Stop or reset after this: that clears the probe reference.",
+        ]
+    else:
+        lines = [
+            "Before this file, with the previous tool still in the spindle:",
+            "1 run the %s macro" % SAVE_MACRO,
+            "2 send T%dM6 from the console, swap the tool, push the button, wait for Idle" % tool,
+            "3 run the %s macro, press Unlock if it stalls" % RESTORE_MACRO,
+            "Then run this file.",
+        ]
+    for line in lines:
+        out += linenumber() + "(" + line + ")\n"
+    return out
+
+
+def section_end(next_tool):
+    """End of a file that is followed by a tool change: retract, spindle off, end of program."""
+    out = ""
+    if OUTPUT_COMMENTS:
+        out += linenumber() + "(end of file: next tool is T%d)\n" % next_tool
+    for line in TOOL_CHANGE.splitlines(True):
+        out += linenumber() + line
+    out += linenumber() + "M30\n"
+    return out
 
 
 def linenumber():
@@ -364,14 +478,15 @@ def parse(pathobj):
 
             # Check for Tool Change:
             if command == "M6":
+                # M6 is never written to the G-code: the D1S zeroes G54 in its own cycle and a
+                # program cannot drive it safely. Leave a marker so export() starts a new file here.
+                marker = TOOL_CHANGE_MARKER % int(c.Parameters.get("T", 0))
                 if TOOL_CHANGE_INDEX == 0:
                     TOOL_CHANGE_INDEX += 1
-                    return "M5\nM3\n"
+                    return out + marker + "M5\nM3\n"
                 TOOL_CHANGE_INDEX += 1
-                # if OUTPUT_COMMENTS:
-                #     out += linenumber() + "(begin toolchange)\n"
-                for line in TOOL_CHANGE.splitlines(True):
-                    out += linenumber() + line
+                out += marker
+                continue
             
             if command == "G54":
                 return ""
