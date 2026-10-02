@@ -221,12 +221,14 @@ $#
 %dz = Number(params.PRB.z) - global.prb0
 G10 L2 P1 X[global.gx] Y[global.gy] Z[global.gz + dz]
 G90
-G53 G0 X[global.hx] Y[global.hy]
-G53 G0 Z[global.hz + dz]
+G0 Z[-(global.gz + dz)]
+G0 X[global.hx - global.gx] Y[global.hy - global.gy]
+G0 Z[global.hz - global.gz]
 ```
-*Known quirk: the first `G53` line after the tool change is never acknowledged by the controller (the move still runs), so the macro stalls with one line left in the queue. Pressing **Unlock** (`$X`) in the CNCjs controller panel releases it and the last line runs. A variant that returns with work-coordinate moves instead of `G53` is being tested.*
+The moves are in work coordinates, so no `G53` is needed: the first lift goes to machine Z0, then it returns to the saved work X/Y and finally the saved work Z. (An earlier version used `G53` moves and stalled the same way, so `G53` is not the problem.)
+*Known quirk: the first motion line after the `G10 L2` is never acknowledged by the controller (the move still runs when it's a real move), so the macro stalls with the last lines still in the queue. Pressing **Unlock** (`$X`) in the CNCjs controller panel releases it and the remaining lines run, so each tool change needs one click. I suspect CNCjs is discarding that line's `ok` as the reply to its own `$G` parser-state query, but I have not confirmed it.*
 
-**Validation:** after each tool change the tip was lowered onto a sheet of paper at the same spot and the DRO read Z0.0 each time (paper touch-off tolerance about ±0.1 mm), with tool length differences between -11.8 and +14.1 mm and different collet seating:
+**Validation:** after each tool change the tip was lowered onto a sheet of paper at the same spot and the DRO read Z0.0 each time (paper touch-off tolerance about ±0.1 mm), with tool length differences between -13.4 and +14.1 mm and different collet seating:
 
 | Change | Probe difference (mm) | DRO Z at paper touch |
 |---|---|---|
@@ -234,6 +236,7 @@ G53 G0 Z[global.hz + dz]
 | T1 to T2 (after a program Stop and reset) | +13.232 | 0.0 |
 | T2 to T1 | -11.840 | 0.0 |
 | T1 to T2 | +12.375 | 0.0 |
+| T2 to T1 | -13.422 | 0.0 |
 
 
 ### Known Issues
