@@ -175,19 +175,71 @@ sudo systemctl start webcamd
 sudo systemctl enable webcamd
 ```
 
+### Tool Changes (M6)
+*Measured on a D1S (GrblHAL 1.1f, `[APP:v1.0.34]`) with CNCjs 1.10.7 and `toolChangePolicy: 1`. Everything below was observed on the serial stream or confirmed with a paper touch-off; the numbers are from my machine.*
+
+`toolChangePolicy: 1` ("Send M6 commands") makes CNCjs forward `M6` to the controller. With the default `0`, CNCjs strips `M6` out of a running program instead. The D1S then runs its own tool change cycle, which does **not** do what CNCjs's own tool change handling would do:
+
+**What `T<n>M6` does on the D1S**
+1. **G54 is zeroed immediately** (G54 becomes 0 / 0 / 0). The tool length offset (`TLO`) stays 0 and the tool table (`T:1`..`T:8`) stays 0, so the new tool length is not applied anywhere.
+2. It lifts to machine Z0 and moves to the tool change position (machine X140 Y0, the front light glows orange, state `Tool`).
+3. After you swap the tool and push the button it moves to the probe (machine X0 Y-7.5), probes twice and reports `[PRB:x,y,z:1]`. The two readings repeat to about 10 µm. `PRB` Z is the machine Z where the tool tip triggered the probe, so a longer tool triggers higher.
+4. It ends `Idle` at machine X0 Y-7.5 Z0. It does **not** return to where it was or restore the work zero.
+
+So the work zero has to be rebuilt after every tool change, in Z as well as X/Y.
+
+**Things that bite**
+- **`error:47` (`ATC: current tool is not set. Set current tool with M61.`)**: after a power loss the firmware has no current tool and refuses `M6`. Send `M61 Q<n>` with `n` set to the tool in the spindle. `Q0` does not count as set, so use 1 or higher. `$EE` lists the controller's error texts.
+- **Stale `G92` offset**: a `G92` offset persists across resets and homing and adds to the work offset (check `$#`; active offset = G54 + G92 + TLO). Mine was left behind by the `G92 X0 Y0 Z0` at the end of a `SAVE_ZERO` macro. Clear it with `G92.1` and do not use `G92` in macros.
+- **The measured tool length changes every time a tool is mounted.** Collet seating moved the same tool by up to about 3 mm between mountings. Always re-probe after installing a tool and never reuse a probe value across mountings.
+- **Don't drive `M6` from a G-code program.** A `%wait` after `M6` never released (the controller never acknowledged the dwell that `%wait` queues, so CNCjs waited forever), and an `M0` right after `M6` pauses CNCjs (and holds the controller) before the cycle starts. Run `T<n>M6` by hand from the console instead.
+- **Don't press Stop in the middle of this.** It soft-resets the controller, which clears `[PRB]` and the firmware's current tool, and it can trigger a pending tool change.
+
+**Procedure**
+- *Starting a job:* install the tool, run `T<n>M6` so it gets probed, touch off X/Y/Z on the work (`G10 L20 P1 X0 Y0 Z0`), then run the job.
+- *Changing tools mid-job:* pause the job, run `SAVE_BEFORE_M6`, run `T<n>M6` from the console, swap the tool, push the button and wait for the machine to go `Idle`, run `RESTORE_AFTER_M6`, then resume. *(I have only tested the two macros on their own with the machine idle, not with a paused job.)*
+
+**Macros** (create these in the CNCjs Macro widget rather than editing `~/.cncrc`, which CNCjs rewrites). In macros the probe result is `params.PRB.z` (the variable is `params`, not `parameters`).
+
+`SAVE_BEFORE_M6` records the work offset, the tool tip position and the current tool's probe reading:
+```
+$#
+%wait
+%global.gx = mposx - posx
+%global.gy = mposy - posy
+%global.gz = mposz - posz
+%global.hx = mposx
+%global.hy = mposy
+%global.hz = mposz
+%global.prb0 = Number(params.PRB.z)
+```
+
+`RESTORE_AFTER_M6` rebuilds G54 (Z is shifted by the difference between the new and old probe readings) and returns the tip to where it was:
+```
+$#
+%wait
+%dz = Number(params.PRB.z) - global.prb0
+G10 L2 P1 X[global.gx] Y[global.gy] Z[global.gz + dz]
+G90
+G53 G0 X[global.hx] Y[global.hy]
+G53 G0 Z[global.hz + dz]
+```
+*Known quirk: the first `G53` line after the tool change is never acknowledged by the controller (the move still runs), so the macro stalls with one line left in the queue. Pressing **Unlock** (`$X`) in the CNCjs controller panel releases it and the last line runs. A variant that returns with work-coordinate moves instead of `G53` is being tested.*
+
+**Validation:** after each tool change the tip was lowered onto a sheet of paper at the same spot and the DRO read Z0.0 each time (paper touch-off tolerance about ±0.1 mm), with tool length differences between -11.8 and +14.1 mm and different collet seating:
+
+| Change | Probe difference (mm) | DRO Z at paper touch |
+|---|---|---|
+| T1 to T2 | +14.098 | 0.0 |
+| T1 to T2 (after a program Stop and reset) | +13.232 | 0.0 |
+| T2 to T1 | -11.840 | 0.0 |
+| T1 to T2 | +12.375 | 0.0 |
+
+
 ### Known Issues
 - I'm still actively working on how CNCjs interacts with the machine during M6 tool changes. You can track the progress of that quest [here](https://github.com/cncjs/cncjs/discussions/958).
 
-  **Root cause:** CNCjs's `tool.toolChangePolicy` in `~/.cncrc` defaults to `0` ("Ignore M6 commands"), which strips the `M6` line out of the running program entirely instead of sending it to the controller — that's why a manual `T<x>M6` had to be retyped into the console to actually trigger the D1S's onboard tool-change routine. Setting `toolChangePolicy` to `1` ("Send M6 commands") makes CNCjs forward the `M6` line to the controller exactly as written, so the D1S's own tool-change/auto-probe cycle fires automatically when the program reaches it (see the [CNCjs Tool widget source](https://github.com/cncjs/cncjs/blob/master/src/app/widgets/Tool/Tool.jsx) for the exact policy definitions). The `.cncrc` above now reflects `toolChangePolicy: 1`.
-
-  With `toolChangePolicy: 1`, the process should simplify to:
-  1. Run the GCODE as normal. When the program reaches a `T<x> M6` line, it's sent straight to the controller and the D1S moves to the tool change position on its own (front light glows orange) — no manual console command needed.
-  2. Change the tool and push the front outer or internal button to let the machine probe the height of the installed tool.
-  3. Once probing completes and the machine returns to a ready state, resume the job.
-
-  *Note: This has not yet been verified against real hardware for a full job. It assumes the D1S's onboard probe cycle correctly restores Work Zero on its own — if Work Zero still drifts afterward, that points to a genuine firmware/CNCjs interaction bug (not a config issue) and is worth a follow-up comment on the [linked discussion](https://github.com/cncjs/cncjs/discussions/958). Until confirmed, fall back to the legacy manual procedure below.*
-
-  Use [gcode/tool-change-test.gcode](gcode/tool-change-test.gcode) to validate the `toolChangePolicy: 1` change on real hardware before trusting it in a production job. It runs 3 tool changes (`T1`/`T2`/`T3` `M6`) and a return-to-Work-Zero check after each, entirely at a safe clearance height with the spindle never commanded on.
+  **Update:** the root cause and a procedure that works are in [Tool Changes (M6)](#tool-changes-m6) above. In short, the D1S zeroes G54 on every `M6` and applies no tool length offset, so the work zero is rebuilt with a pair of macros after each change instead of expecting the machine to restore it. The earlier assumption that the machine restores Work Zero on its own was wrong, so [gcode/tool-change-test.gcode](gcode/tool-change-test.gcode) is superseded and its pass criteria (return to G54 X0/Y0 after each `M6`, `M0` as the resume point) no longer apply.
 
   **Legacy manual workaround** (`toolChangePolicy: 0`):
   1. Set CNCjs to "Ignore M6 commands (Default)"
