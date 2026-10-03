@@ -21,11 +21,14 @@ FreeCAD, via the GUI importer or via python scripts with:
 import maxmake_post
 maxmake_post.export(object,"/path/to/file.ncc","")
 
-Tool changes: the D1S zeroes G54 on every M6 and applies no tool length offset, and a
-running program cannot safely drive its tool change cycle, so M6 is never written to the
-G-code. Instead every tool change starts a new file (<name>_01_T1.nc, <name>_02_T2.nc, ...)
-and each file begins with a comment block listing the steps to take before running it
-(the SAVE_BEFORE_M6 / RESTORE_AFTER_M6 macros, see CNCjs/README.md).
+Tool changes (needs D1S firmware V1.0.38 or later and CNCjs toolChangePolicy 1): the D1S
+zeroes G54 on every M6 and applies no tool length offset. Each tool change is written as
+T<n> M6 followed by M0: the job stops while you swap the tool and push the button, and after
+you press Resume, CNCjs-evaluated lines rebuild G54 with the probe difference applied to Z and
+return to where the job left off. See CNCjs/README.md.
+
+With --split-files every tool change starts a new file instead (<name>_01_T1.nc, ...) and
+the work zero is rebuilt by hand with the SAVE_BEFORE_M6 / RESTORE_AFTER_M6 macros.
 """
 
 now = datetime.datetime.now()
@@ -57,6 +60,11 @@ parser.add_argument(
     help="Output the Same G-command Name USE NonModal Mode",
 )
 parser.add_argument("--axis-modal", action="store_true", help="Output the Same Axis Value Mode")
+parser.add_argument(
+    "--split-files",
+    action="store_true",
+    help="write one file per tool and leave the tool change to the CNCjs macros",
+)
 
 TOOLTIP_ARGS = parser.format_help()
 
@@ -90,6 +98,22 @@ TOOL_CHANGE_MARKER_RE = r"@@TOOLCHANGE (\d+)@@\n"
 # CNCjs macros that rebuild the work zero around a tool change (see CNCjs/README.md)
 SAVE_MACRO = "SAVE_BEFORE_M6"
 RESTORE_MACRO = "RESTORE_AFTER_M6"
+
+# One file with in-program tool changes (default), or one file per tool (--split-files)
+SPLIT_FILES = False
+
+# Work Z the tool retracts to before a tool change; must match the G0 Z in TOOL_CHANGE below
+TOOL_CHANGE_Z = 5.0
+
+# Machine position where the D1S's tool change cycle always ends (its tool probe, raised to Z0).
+# CNCjs reaches the M0 after T<n> M6 long before the machine does, so the restore only goes
+# ahead once the machine is actually there, i.e. the new tool has been probed.
+PROBE_END_MPOS = (0.0, -7.5, 0.0)
+
+# Last X/Y written (output units) and the X/Y in effect at each tool change, so the job can
+# return there afterwards. Reset at the start of every export.
+LAST_XY = [None, None]
+TOOL_CHANGE_POSES = []
 
 # Preamble text will appear at the beginning of the GCODE output file.
 PREAMBLE = """"""
@@ -129,6 +153,7 @@ def processArguments(argstring):
     global UNIT_FORMAT
     global MODAL
     global OUTPUT_DOUBLES
+    global SPLIT_FILES
 
     try:
         args = parser.parse_args(shlex.split(argstring))
@@ -151,6 +176,8 @@ def processArguments(argstring):
             UNIT_SPEED_FORMAT = "in/min"
             UNIT_FORMAT = "in"
             PRECISION = 4
+        if args.split_files:
+            SPLIT_FILES = True
         if args.modal:
             MODAL = True
         if args.axis_modal:
@@ -180,6 +207,8 @@ def export(objectslist, filename, argstring):
     print("postprocessing...")
     global TOOL_CHANGE_INDEX
     TOOL_CHANGE_INDEX = 0  # state from a previous export in this session must not leak in
+    LAST_XY[:] = [None, None]
+    del TOOL_CHANGE_POSES[:]
 
     head = ""
 
@@ -267,10 +296,16 @@ def export(objectslist, filename, argstring):
     for line in POSTAMBLE.splitlines(True):
         postamble += linenumber() + line
 
-    # Assemble one output per tool (a single output when the job has no tool change)
+    # Assemble the output: one file with in-program tool changes, or one file per tool
     if not sections:
         tools = [None]
         texts = [head + prefix[0] + postamble]
+    elif not SPLIT_FILES:
+        tools = [None]
+        text = head + job_banner([tool for tool, _ in sections]) + prefix[0] + sections[0][1]
+        for i in range(1, len(sections)):
+            text += tool_change_block(i, sections[i][0], TOOL_CHANGE_POSES[i]) + sections[i][1]
+        texts = [text + postamble]
     else:
         tools = [tool for tool, _ in sections]
         texts = []
@@ -353,6 +388,97 @@ def section_end(next_tool):
     for line in TOOL_CHANGE.splitlines(True):
         out += linenumber() + line
     out += linenumber() + "M30\n"
+    return out
+
+
+def job_banner(tools):
+    """Comment block at the top of a single-file job with in-program tool changes.
+
+    Plain comments only: no parentheses or square brackets inside (CNCjs evaluates square
+    brackets and Grbl comments end at the first closing parenthesis).
+    """
+    out = linenumber() + "(tools in this job: %s)\n" % " then ".join("T%d" % t for t in tools)
+    if not OUTPUT_COMMENTS:
+        return out
+    first = tools[0]
+    lines = [
+        "Needs D1S firmware V1.0.38 or later and CNCjs tool change policy Send M6 commands.",
+        "Before running: install T%d. After a power cycle send M61 Q%d first." % (first, first),
+        "Send T%dM6 and push the button so T%d is probed, then touch off X Y Z and set the zero with G10 L20 P1 X0 Y0 Z0."
+        % (first, first),
+        "At each tool change the job stops after probing: swap the tool, push the button, wait for Idle, then press Resume.",
+        "If it stops again right after you resume, the probe reference is missing: press Stop and do not resume.",
+        "At the end CNCjs may keep showing the job as running: press Stop once the machine is Idle.",
+    ]
+    for line in lines:
+        out += linenumber() + "(" + line + ")\n"
+    return out
+
+
+def tool_change_block(index, tool, pose):
+    """In-program tool change: retract, T<n> M6, M0, then rebuild G54 and return to `pose`.
+
+    The % and [ ] lines are evaluated by CNCjs when it sends them, so they run after the M0
+    once the cycle has finished and CNCjs has parsed the new [PRB] reading. They must start
+    in column 1 and never get a line number. If the probe reference is missing, a line turns
+    into M0 and stops the job before anything that depends on it is sent.
+
+    CNCjs's evaluator is not JavaScript: && does not short-circuit (params.PRB.z throws when
+    there is no reading, and the assignment is then skipped) and NaN is not a known name.
+    So each value is first reset to a safe one (0, or 0 / 0 for NaN) and then assigned in a
+    form that throws, leaving the safe value in place, when the reading is missing.
+    """
+    x, y = [0.0 if v is None else v for v in pose]
+    fmt = "." + str(PRECISION) + "f"
+    out = ""
+    if OUTPUT_COMMENTS:
+        out += linenumber() + "(tool change to T%d)\n" % tool
+    for line in TOOL_CHANGE.splitlines(True):
+        out += linenumber() + line
+    if index == 1:
+        # G54 offset as set by the touch-off, and the first tool's probe reading as reference.
+        # mpos - pos is the work offset, which stays valid while earlier moves are still queued.
+        out += "%global.gx = mposx - posx\n"
+        out += "%global.gy = mposy - posy\n"
+        out += "%global.gz = mposz - posz\n"
+        out += "%global.prb0 = 0\n"
+        out += "%global.prb0 = params.PRB.result === 1 ? Number(params.PRB.z) : 0\n"
+    msg = (
+        "Tool change to T%d ahead: when the machine stops at the tool change position, swap the tool and push"
+        " the button. Press Resume only after it has probed the tool and stopped." % tool
+    )
+    out += '%%msg [global.prb0 < 0 ? "%s" : "No probe reference: press Stop and probe the tool first"]\n' % msg
+    out += '[global.prb0 < 0 ? "(probe reference ok)" : "M0"]\n'
+    out += linenumber() + "T%d M6\n" % tool
+    out += linenumber() + "M0\n"
+    # Resume pressed before the cycle has finished: stop again before the restore is evaluated.
+    # Checked twice, so it takes two early presses to get past it.
+    at_probe = "mposx === %s && mposy === %s && mposz === %s" % tuple(repr(float(v)) for v in PROBE_END_MPOS)
+    for _ in range(2):
+        out += (
+            '%%msg [%s ? "" : "Resumed too early: wait until the new tool has been probed and the machine has'
+            ' stopped, then press Resume"]\n' % at_probe
+        )
+        out += '[%s ? "(new tool probed)" : "M0"]\n' % at_probe
+    # The shift is only valid once the machine is back at the probe: if Resume got past both
+    # checks above anyway, dz stays NaN and the job stops below instead of using the old reading.
+    out += "%dz = 0 / 0\n"
+    out += (
+        "%%dz = %s && params.PRB.result === 1 && Number(params.PRB.z) < 0 && global.prb0 < 0"
+        " ? Number(params.PRB.z) - global.prb0 : 0 / 0\n" % at_probe
+    )
+    out += (
+        '%msg [dz === dz ? "" : "Not safe to continue: the new tool was not probed or the reading is missing.'
+        ' Press Stop and do not resume"]\n'
+    )
+    out += '[dz === dz ? "(probe ok)" : "M0"]\n'
+    out += "G10 L2 P1 X[global.gx] Y[global.gy] Z[global.gz + dz]\n"
+    out += linenumber() + "G90\n"
+    out += "G0 Z[-(global.gz + dz)]\n"
+    out += "G0 X[%s + 0 * dz] Y[%s + 0 * dz]\n" % (format(x, fmt), format(y, fmt))
+    out += "G0 Z[%s + 0 * dz]\n" % format(TOOL_CHANGE_Z, fmt)
+    out += "%global.gz = global.gz + dz\n"
+    out += "%global.prb0 = Number(params.PRB.z)\n"
     return out
 
 
@@ -475,12 +601,18 @@ def parse(pathobj):
             # store the latest command
             lastcommand = command
             currLocation.update(c.Parameters)
+            if command in ("G0", "G00", "G1", "G01", "G2", "G02", "G3", "G03"):
+                for i, axis in enumerate(("X", "Y")):
+                    if axis in c.Parameters:
+                        pos = Units.Quantity(c.Parameters[axis], FreeCAD.Units.Length)
+                        LAST_XY[i] = float(pos.getValueAs(UNIT_FORMAT))
 
             # Check for Tool Change:
             if command == "M6":
                 # M6 is never written to the G-code: the D1S zeroes G54 in its own cycle and a
                 # program cannot drive it safely. Leave a marker so export() starts a new file here.
                 marker = TOOL_CHANGE_MARKER % int(c.Parameters.get("T", 0))
+                TOOL_CHANGE_POSES.append(tuple(LAST_XY))
                 if TOOL_CHANGE_INDEX == 0:
                     TOOL_CHANGE_INDEX += 1
                     return out + marker + "M5\nM3\n"

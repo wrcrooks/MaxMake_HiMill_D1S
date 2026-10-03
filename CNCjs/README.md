@@ -192,7 +192,7 @@ So the work zero has to be rebuilt after every tool change, in Z as well as X/Y.
 - **`error:47` (`ATC: current tool is not set. Set current tool with M61.`)**: after a power loss the firmware has no current tool and refuses `M6`. Send `M61 Q<n>` with `n` set to the tool in the spindle. `Q0` does not count as set, so use 1 or higher. `$EE` lists the controller's error texts.
 - **Stale `G92` offset**: a `G92` offset persists across resets and homing and adds to the work offset (check `$#`; active offset = G54 + G92 + TLO). Mine was left behind by the `G92 X0 Y0 Z0` at the end of a `SAVE_ZERO` macro. Clear it with `G92.1` and do not use `G92` in macros.
 - **The measured tool length changes every time a tool is mounted.** Collet seating moved the same tool by up to about 3 mm between mountings. Always re-probe after installing a tool and never reuse a probe value across mountings.
-- **Don't drive `M6` from a G-code program.** A `%wait` after `M6` never released (the controller never acknowledged the dwell that `%wait` queues, so CNCjs waited forever), and an `M0` right after `M6` pauses CNCjs (and holds the controller) before the cycle starts. Run `T<n>M6` by hand from the console instead.
+- **On firmware V1.0.34, don't drive `M6` from a G-code program.** A `%wait` after `M6` never released (the controller never acknowledged the dwell that `%wait` queues, so CNCjs waited forever), and an `M0` right after `M6` pauses CNCjs (and holds the controller) before the cycle starts. Run `T<n>M6` by hand from the console instead. V1.0.38 fixes this, see [below](#firmware-v1038-tool-changes-inside-the-program).
 - **Don't press Stop in the middle of this.** It soft-resets the controller, which clears `[PRB]` and the firmware's current tool, and it can trigger a pending tool change.
 
 **Procedure**
@@ -237,6 +237,24 @@ The moves are in work coordinates, so no `G53` is needed: the first lift goes to
 | T2 to T1 | -11.840 | 0.0 |
 | T1 to T2 | +12.375 | 0.0 |
 | T2 to T1 | -13.422 | 0.0 |
+
+These were all on firmware V1.0.34. The macros and the post-processor's `--split-files` mode have not been tried on V1.0.38, where their `%wait` lines may stall (see below).
+
+#### Firmware V1.0.38: tool changes inside the program
+V1.0.38 ([release record](https://wiki.maxmake.com/en/himill-d1-d1s/hmd1s-firmware-release-record.md)) "fixed the issue where subsequent code was still executed during tool change in streaming machining". Measured with CNCjs 1.10.7 after updating:
+- Lines after `T<n> M6` in a program now wait for the cycle to finish. An `M0` right after the `M6` holds the controller once the new tool has been probed, and Resume carries on.
+- CNCjs reads the new `[PRB:...]` line by itself, so `params.PRB.z` is up to date before you press Resume. No `$#` is needed.
+- Unchanged: `M6` still zeroes G54, no tool length offset is applied, and the cycle still ends at machine X0 Y-7.5 Z0. A Stop (soft reset) still clears the probe reading and sets the firmware's current tool back to an older number, so send `M61 Q<n>` for the tool in the spindle before the next job.
+- New quirks: a `%wait` in the middle of a program can stall, because one `ok` never arrives (press **Unlock**, or Pause then Resume, to release it). At the end of a job CNCjs keeps showing it as running (only Pause is active) although the machine has finished, so press Stop once the machine is Idle. I have not found the cause of either.
+
+The FreeCAD post-processor now writes tool changes this way by default (one file per job), so no macro or console command is needed between tools:
+1. Install the first tool (send `M61 Q<n>` after a power cycle), send `T<n>M6` and push the button so it gets probed, then touch off X/Y/Z (`G10 L20 P1 X0 Y0 Z0`) and run the job.
+2. At each tool change CNCjs pauses with "Tool change to T<n> ahead". It reaches that point in the file well before the machine does, so wait until the machine stops at the tool change position, swap the tool, push the button, and press Resume only after it has probed the tool and stopped.
+3. The job then rebuilds G54 with the probe difference applied to Z, goes back to where it left off and carries on.
+
+Safety checks are written into each tool change. If there is no probe reference, if Resume is pressed before the machine is back at the probe, or if the reading is missing, one of the generated lines turns into `M0` and the job stops before anything that depends on it is sent. One or two early presses just pause it again; a third stops it with "Not safe to continue". (These checks were tested against CNCjs's own expression code, not yet on the machine.) When a message says to press Stop and not resume, do that: resuming past it would run the rest of the job against the zeroed G54.
+
+Validation on V1.0.38 (air-cut, spindle off): tool 1 probed at -72.444 with G54 Z at -63.257. After the in-program change to tool 2 (probe -55.768, a +16.676 mm difference), the job set G54 Z to -46.581, exactly the probe difference, and returned to where it left off. Lowered onto a sheet of paper at the work zero, tool 2 dragged at DRO Z0.0.
 
 
 ### Known Issues
