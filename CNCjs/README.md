@@ -20,7 +20,7 @@ These steps were heavily inspired by the tutorial [here](https://www.apalrd.net/
 ```
 # Install
 sudo apt install nodejs npm
-sudo npm install -g cncjs --unsafe-perms
+sudo npm install -g cncjs --unsafe-perm
 
 # Test Installation
 cncjs --allow-remote-access -p 8080
