@@ -102,9 +102,6 @@ RESTORE_MACRO = "RESTORE_AFTER_M6"
 # One file with in-program tool changes (default), or one file per tool (--split-files)
 SPLIT_FILES = False
 
-# Work Z the tool retracts to before a tool change; must match the G0 Z in TOOL_CHANGE below
-TOOL_CHANGE_Z = 5.0
-
 # Machine position where the D1S's tool change cycle always ends (its tool probe, raised to Z0).
 # CNCjs reaches the M0 after T<n> M6 long before the machine does, so the restore only goes
 # ahead once the machine is actually there, i.e. the new tool has been probed.
@@ -117,13 +114,15 @@ TOOL_CHANGE_POSES = []
 
 # Preamble text will appear at the beginning of the GCODE output file.
 PREAMBLE = """"""
+DEFAULT_PREAMBLE = PREAMBLE
 
-# Postamble text will appear following the last operation.
-POSTAMBLE = """G0Z5.000S13000
-G0X0.000Y0.000S13000
-G0Z5.000
+# Postamble text will appear following the last operation. Retracts to the machine top
+# (G53 G0 Z0) rather than a work Z, so it is safe wherever the work zero was set.
+POSTAMBLE = """G53 G0 Z0
+G0 X0.000 Y0.000
 M30
 """
+DEFAULT_POSTAMBLE = POSTAMBLE
 
 # Pre operation text will be inserted before every operation
 PRE_OPERATION = """"""
@@ -131,8 +130,9 @@ PRE_OPERATION = """"""
 # Post operation text will be inserted after every operation
 POST_OPERATION = """"""
 
-# Tool Change commands are written at the end of the file that precedes a tool change
-TOOL_CHANGE = """G0Z5.000S13000
+# Tool Change commands are written before each tool change: retract to the machine top
+# (G53 G0 Z0, safe wherever the work zero was set) and stop the spindle.
+TOOL_CHANGE = """G53 G0 Z0
 M5
 """
 
@@ -154,6 +154,21 @@ def processArguments(argstring):
     global MODAL
     global OUTPUT_DOUBLES
     global SPLIT_FILES
+
+    # FreeCAD keeps this module loaded between exports, so start from the defaults every time;
+    # otherwise an option given once (e.g. --split-files) silently applies to later exports.
+    OUTPUT_HEADER = True
+    OUTPUT_COMMENTS = True
+    OUTPUT_LINE_NUMBERS = False
+    SHOW_EDITOR = True
+    PREAMBLE = DEFAULT_PREAMBLE
+    POSTAMBLE = DEFAULT_POSTAMBLE
+    UNITS = "G21"
+    UNIT_SPEED_FORMAT = "mm/min"
+    UNIT_FORMAT = "mm"
+    MODAL = False
+    OUTPUT_DOUBLES = True
+    SPLIT_FILES = False
 
     try:
         args = parser.parse_args(shlex.split(argstring))
@@ -181,10 +196,10 @@ def processArguments(argstring):
         if args.modal:
             MODAL = True
         if args.axis_modal:
-            print("here")
             OUTPUT_DOUBLES = False
 
-    except:
+    except (SystemExit, Exception) as e:  # argparse exits on bad arguments
+        print("maxmake_post: could not use the arguments %r: %s" % (argstring, e))
         return False
 
     return True
@@ -206,7 +221,11 @@ def export(objectslist, filename, argstring):
 
     print("postprocessing...")
     global TOOL_CHANGE_INDEX
+    global LINENR
+    global now
     TOOL_CHANGE_INDEX = 0  # state from a previous export in this session must not leak in
+    LINENR = 100
+    now = datetime.datetime.now()
     LAST_XY[:] = [None, None]
     del TOOL_CHANGE_POSES[:]
 
@@ -259,7 +278,7 @@ def export(objectslist, filename, argstring):
         # do the pre_op
         begin = ""
         if OUTPUT_COMMENTS:
-            begin += linenumber() + "(begin operation: %s)\n" % obj.Label
+            begin += linenumber() + "(begin operation: %s)\n" % comment_text(obj.Label)
             begin += linenumber() + "(machine: %s, %s)\n" % (
                 myMachine,
                 UNIT_SPEED_FORMAT,
@@ -284,7 +303,7 @@ def export(objectslist, filename, argstring):
         # do the post_op
         post = ""
         if OUTPUT_COMMENTS:
-            post += linenumber() + "(finish operation: %s)\n" % obj.Label
+            post += linenumber() + "(finish operation: %s)\n" % comment_text(obj.Label)
         for line in POST_OPERATION.splitlines(True):
             post += linenumber() + line
         add(post)
@@ -295,6 +314,23 @@ def export(objectslist, filename, argstring):
         postamble += "(begin postamble)\n"
     for line in POSTAMBLE.splitlines(True):
         postamble += linenumber() + line
+
+    # The program has to state its units: the controller does not follow FreeCAD's settings.
+    head += linenumber() + UNITS + "\n"
+
+    if len(sections) > 1 and not SPLIT_FILES:
+        # The tool change block rebuilds G54 from machine positions reported in mm, and only G54.
+        body = prefix[0] + "".join(text for _, text in sections)
+        if UNITS != "G21":
+            print("maxmake_post: tool changes inside the program only work in mm; use --split-files or metric output")
+            return None
+        other = re.search(r"^(N\d+ )?(G5[5-9](\.\d)?)\b", body, re.M)
+        if other:
+            print(
+                "maxmake_post: this job uses work offset %s; tool changes inside the program only work"
+                " with G54. Use G54 or --split-files." % other.group(2)
+            )
+            return None
 
     # Assemble the output: one file with in-program tool changes, or one file per tool
     if not sections:
@@ -416,7 +452,10 @@ def job_banner(tools):
 
 
 def tool_change_block(index, tool, pose):
-    """In-program tool change: retract, T<n> M6, M0, then rebuild G54 and return to `pose`.
+    """In-program tool change: retract, T<n> M6, M0, then rebuild G54 and return over `pose`.
+
+    The tool goes back to the X/Y it left from but stays at the machine top; the next
+    operation's own moves bring it down, at heights the CAM job already made safe.
 
     The % and [ ] lines are evaluated by CNCjs when it sends them, so they run after the M0
     once the cycle has finished and CNCjs has parsed the new [PRB] reading. They must start
@@ -476,10 +515,15 @@ def tool_change_block(index, tool, pose):
     out += linenumber() + "G90\n"
     out += "G0 Z[-(global.gz + dz)]\n"
     out += "G0 X[%s + 0 * dz] Y[%s + 0 * dz]\n" % (format(x, fmt), format(y, fmt))
-    out += "G0 Z[%s + 0 * dz]\n" % format(TOOL_CHANGE_Z, fmt)
     out += "%global.gz = global.gz + dz\n"
     out += "%global.prb0 = Number(params.PRB.z)\n"
     return out
+
+
+def comment_text(text):
+    """Text safe inside a G-code comment: Grbl ends a comment at the first ')', and CNCjs
+    evaluates anything in square brackets."""
+    return re.sub(r"[()\[\]]", "", str(text))
 
 
 def linenumber():
@@ -601,7 +645,7 @@ def parse(pathobj):
             # store the latest command
             lastcommand = command
             currLocation.update(c.Parameters)
-            if command in ("G0", "G00", "G1", "G01", "G2", "G02", "G3", "G03"):
+            if command in ("G0", "G00", "G1", "G01", "G2", "G02", "G3", "G03", "G73", "G81", "G82", "G83", "G85", "G86", "G89"):
                 for i, axis in enumerate(("X", "Y")):
                     if axis in c.Parameters:
                         pos = Units.Quantity(c.Parameters[axis], FreeCAD.Units.Length)
@@ -611,13 +655,14 @@ def parse(pathobj):
             if command == "M6":
                 # M6 is never written to the G-code: the D1S zeroes G54 in its own cycle and a
                 # program cannot drive it safely. Leave a marker so export() starts a new file here.
+                # The tool controller's own spindle command (e.g. M3 S13000) follows and is kept,
+                # so the speed is set for every tool, the first one included.
                 marker = TOOL_CHANGE_MARKER % int(c.Parameters.get("T", 0))
                 TOOL_CHANGE_POSES.append(tuple(LAST_XY))
-                if TOOL_CHANGE_INDEX == 0:
-                    TOOL_CHANGE_INDEX += 1
-                    return out + marker + "M5\nM3\n"
-                TOOL_CHANGE_INDEX += 1
                 out += marker
+                if TOOL_CHANGE_INDEX == 0:
+                    out += linenumber() + "M5\n"
+                TOOL_CHANGE_INDEX += 1
                 continue
             
             if command == "G54":
@@ -625,9 +670,8 @@ def parse(pathobj):
 
             if command == "message":
                 if OUTPUT_COMMENTS is False:
-                    out = []
-                else:
-                    outstring.pop(0)  # remove the command
+                    continue
+                outstring.pop(0)  # remove the command
 
             # prepend a line number and append a newline
             if len(outstring) >= 1:

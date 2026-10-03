@@ -1,7 +1,8 @@
 (Exported by FreeCAD)
 (Post Processor: maxmake_post)
-(Output Time:2026-10-02 21:22:17.063312)
+(Output Time:2026-10-02 22:18:32.076269)
 (begin preamble)
+G21
 (tools in this job: T1 then T2)
 (Needs D1S firmware V1.0.38 or later and CNCjs tool change policy Send M6 commands.)
 (Before running: install T1. After a power cycle send M61 Q1 first.)
@@ -12,7 +13,7 @@
 (begin operation: Tool 1)
 (machine: not set, mm/min)
 M5
-M3
+M3 S13000
 (finish operation: Tool 1)
 (begin operation: Square tool 1)
 (machine: not set, mm/min)
@@ -26,7 +27,7 @@ G1 Y10.000
 G0 Z5.000
 (finish operation: Square tool 1)
 (tool change to T2)
-G0Z5.000S13000
+G53 G0 Z0
 M5
 %global.gx = mposx - posx
 %global.gy = mposy - posy
@@ -49,7 +50,6 @@ G10 L2 P1 X[global.gx] Y[global.gy] Z[global.gz + dz]
 G90
 G0 Z[-(global.gz + dz)]
 G0 X[10.000 + 0 * dz] Y[10.000 + 0 * dz]
-G0 Z[5.000 + 0 * dz]
 %global.gz = global.gz + dz
 %global.prb0 = Number(params.PRB.z)
 (begin operation: Tool 2)
@@ -68,7 +68,6 @@ G1 Y15.000
 G0 Z5.000
 (finish operation: Square tool 2)
 (begin postamble)
-G0Z5.000S13000
-G0X0.000Y0.000S13000
-G0Z5.000
+G53 G0 Z0
+G0 X0.000 Y0.000
 M30
